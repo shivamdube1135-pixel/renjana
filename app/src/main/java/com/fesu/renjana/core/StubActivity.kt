@@ -96,6 +96,17 @@ abstract class StubActivity : Activity() {
         } catch (_: Throwable) {}
     }
 
+    private fun warmupWebViewOnMainThread() {
+        if (Build.VERSION.SDK_INT < 34) return
+        try {
+            val webViewClass = Class.forName("android.webkit.WebView")
+            val setDataDirSuffix = webViewClass.getDeclaredMethod("setDataDirectorySuffix", String::class.java)
+            setDataDirSuffix.isAccessible = true
+            val suffix = "${instanceId.take(8)}_${getStubIndex()}"
+            setDataDirSuffix.invoke(null, suffix)
+        } catch (_: Throwable) {}
+    }
+
     override fun attachBaseContext(newBase: Context?) {
         try {
             androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
@@ -151,6 +162,8 @@ abstract class StubActivity : Activity() {
             finish()
             return
         }
+
+        warmupWebViewOnMainThread()
 
         try {
             androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
@@ -481,31 +494,7 @@ abstract class StubActivity : Activity() {
                     top.canyie.pine.Pine.hook(getAppMethod, object : top.canyie.pine.callback.MethodReplacement() {
                         override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = effectiveApp
                     })
-                    RenjanaLog.i(TAG, "Pine hooked Activity.getApplication()")
-                } catch (e: Throwable) {
-                    RenjanaLog.w(TAG, "Failed to Pine hook getApplication: ${e.message}")
-                }
-
-                try {
-                    val pmClass = packageManager.javaClass
-                    val safeInfo = resolvedInfo
-                    val targetGuestClass = guestClassName
-                    for (m in pmClass.declaredMethods.filter { it.name == "getActivityInfo" }) {
-                        try {
-                            top.canyie.pine.Pine.hook(m, object : top.canyie.pine.callback.MethodHook() {
-                                override fun beforeCall(callFrame: top.canyie.pine.Pine.CallFrame?) {
-                                    val comp = callFrame?.args?.getOrNull(0) as? android.content.ComponentName
-                                    if (comp != null && (comp.className == targetGuestClass || comp.className.contains(targetGuestClass))) {
-                                        callFrame.result = safeInfo
-                                    }
-                                }
-                            })
-                        } catch (_: Throwable) {}
-                    }
-                    RenjanaLog.i(TAG, "Pine hooked PackageManager.getActivityInfo for $guestClassName")
-                } catch (e: Throwable) {
-                    RenjanaLog.w(TAG, "Failed to Pine hook getActivityInfo: ${e.message}")
-                }
+                } catch (_: Throwable) {}
             }
 
             try {
@@ -577,20 +566,6 @@ abstract class StubActivity : Activity() {
                         try {
                             field.isAccessible = true
                             field.setBoolean(rmiInstance, true)
-                        } catch (_: Throwable) {}
-                    }
-                }
-
-                if (PineHookManager.isAvailable() && Build.VERSION.SDK_INT < 34) {
-                    rmiClass.declaredMethods.filter {
-                        it.parameterCount == 1 &&
-                        Context::class.java.isAssignableFrom(it.parameterTypes[0]) &&
-                        (it.returnType == java.lang.Void.TYPE || it.returnType == Void.TYPE)
-                    }.forEach { method ->
-                        try {
-                            top.canyie.pine.Pine.hook(method, object : top.canyie.pine.callback.MethodReplacement() {
-                                override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = null
-                            })
                         } catch (_: Throwable) {}
                     }
                 }
