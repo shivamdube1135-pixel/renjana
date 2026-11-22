@@ -20,6 +20,7 @@ import com.fesu.renjana.models.Instance
 import com.fesu.renjana.utils.RenjanaLog
 import com.fesu.renjana.virtual.VirtualContext
 import kotlinx.coroutines.launch
+import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
 abstract class StubActivity : Activity() {
@@ -77,6 +78,23 @@ abstract class StubActivity : Activity() {
     private var onRequestPermissionsResultMethod: Method? = null
     private var onConfigurationChangedMethod: Method? = null
     private var onWindowFocusChangedMethod: Method? = null
+
+    private fun unwrapError(t: Throwable): Throwable {
+        var cur: Throwable = t
+        while (cur is InvocationTargetException && cur.targetException != null) {
+            cur = cur.targetException!!
+        }
+        return cur
+    }
+
+    private fun showCrashToast(stage: String, t: Throwable) {
+        val real = unwrapError(t)
+        val msg = "$stage: ${real.javaClass.simpleName}: ${real.message}"
+        RenjanaLog.e(TAG, msg, real)
+        try {
+            Toast.makeText(this, msg.take(180), Toast.LENGTH_LONG).show()
+        } catch (_: Throwable) {}
+    }
 
     override fun attachBaseContext(newBase: Context?) {
         try {
@@ -243,7 +261,7 @@ abstract class StubActivity : Activity() {
                     app.onCreate()
                     RenjanaLog.i(TAG, "Guest Application started: ${launchInfo.applicationClass}")
                 } catch (e: Throwable) {
-                    RenjanaLog.w(TAG, "Guest Application.onCreate failed (non-fatal): ${e.message}")
+                    showCrashToast("App.onCreate", e)
                 }
             }
 
@@ -273,17 +291,18 @@ abstract class StubActivity : Activity() {
             reportStateToService(InstanceNotificationManager.ACTION_OPEN_INSTANCE)
 
             if (onCreateMethod != null) {
-                onCreateMethod!!.invoke(guestActivity, savedInstanceState)
+                try {
+                    onCreateMethod!!.invoke(guestActivity, savedInstanceState)
+                } catch (e: Throwable) {
+                    showCrashToast("Activity.onCreate", e)
+                    finish()
+                }
             } else {
                 RenjanaLog.w(TAG, "Guest $guestClassName has no onCreate method")
             }
 
         } catch (e: Throwable) {
-            val cause = e.cause ?: e
-            RenjanaLog.e(TAG, "Failed to launch guest $guestClassName: ${cause.message}", cause)
-            try {
-                Toast.makeText(this, "Launch error: ${cause.javaClass.simpleName}: ${cause.message}", Toast.LENGTH_LONG).show()
-            } catch (_: Throwable) {}
+            showCrashToast("Launch", e)
             finish()
         }
     }
@@ -318,6 +337,10 @@ abstract class StubActivity : Activity() {
                         zip.getInputStream(entry).use { input ->
                             java.io.FileOutputStream(out).use { output -> input.copyTo(output) }
                         }
+                        try {
+                            out.setReadable(true, false)
+                            out.setExecutable(true, false)
+                        } catch (_: Throwable) {}
                     }
                 }
             } catch (_: Throwable) {}
@@ -341,7 +364,7 @@ abstract class StubActivity : Activity() {
             RenjanaLog.i(TAG, "Guest Application attached: $className")
             app
         } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Guest Application could not start (continuing): ${e.message}", e)
+            showCrashToast("App.attach", e)
             null
         }
     }
@@ -355,7 +378,7 @@ abstract class StubActivity : Activity() {
                 provider.attachInfo(context, providerInfo)
                 RenjanaLog.d(TAG, "Guest provider started: ${providerInfo.name}")
             } catch (e: Throwable) {
-                RenjanaLog.w(TAG, "Guest provider failed (non-fatal): ${providerInfo.name}: ${e.message}", e)
+                RenjanaLog.w(TAG, "Guest provider failed (non-fatal): ${providerInfo.name}: ${unwrapError(e).message}")
             }
         }
     }
@@ -365,7 +388,7 @@ abstract class StubActivity : Activity() {
         try {
             attachGuestToHost(guest, guestClassName)
         } catch (e: Exception) {
-            RenjanaLog.w(TAG, "Guest attach failed (non-fatal): ${e.message}")
+            showCrashToast("AttachHost", e)
             finish()
             return
         }
@@ -558,7 +581,6 @@ abstract class StubActivity : Activity() {
                     }
                 }
 
-                // Skip Pine hooking ResourceManagerInternal on Android 14/15 to avoid ART crashes
                 if (PineHookManager.isAvailable() && Build.VERSION.SDK_INT < 34) {
                     rmiClass.declaredMethods.filter {
                         it.parameterCount == 1 &&
@@ -640,8 +662,8 @@ abstract class StubActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        try { onStartMethod?.invoke(guestActivity) } catch (e: Exception) {
-            RenjanaLog.w(TAG, "Guest onStart failed: ${e.message}")
+        try { onStartMethod?.invoke(guestActivity) } catch (e: Throwable) {
+            showCrashToast("Activity.onStart", e)
         }
     }
 
@@ -649,8 +671,8 @@ abstract class StubActivity : Activity() {
         super.onResume()
         ActivityStubManager.onStubResumed(instanceId, getStubIndex())
         reportStateToService(InstanceNotificationManager.ACTION_OPEN_INSTANCE)
-        try { onResumeMethod?.invoke(guestActivity) } catch (e: Exception) {
-            RenjanaLog.w(TAG, "Guest onResume failed: ${e.message}")
+        try { onResumeMethod?.invoke(guestActivity) } catch (e: Throwable) {
+            showCrashToast("Activity.onResume", e)
         }
     }
 
