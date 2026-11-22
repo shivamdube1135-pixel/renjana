@@ -1,680 +1,906 @@
-package com.fesu.renjana.hooks
+package com.fesu.renjana.core
 
 import android.app.Activity
+import android.app.Application
+import android.content.Context
 import android.content.Intent
+import android.content.res.AssetManager
+import android.content.res.Configuration
+import android.content.res.Resources
 import android.os.Build
 import android.os.Bundle
-import android.telephony.TelephonyManager
-import com.fesu.renjana.RenjanaApplication
+import android.view.KeyEvent
+import android.view.Menu
+import android.view.MenuItem
+import android.view.MotionEvent
+import android.widget.Toast
+import com.fesu.renjana.hooks.CoreHooks
+import com.fesu.renjana.hooks.PineHookManager
 import com.fesu.renjana.models.Instance
 import com.fesu.renjana.utils.RenjanaLog
-import com.fesu.renjana.virtual.GuestInfoCache
-import dalvik.system.DexClassLoader
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import org.lsposed.hiddenapibypass.HiddenApiBypass
-import top.canyie.pine.PineConfig
-import java.io.File
-import java.lang.reflect.Member
+import com.fesu.renjana.virtual.VirtualContext
+import kotlinx.coroutines.launch
 import java.lang.reflect.Method
 
-object PineHookManager {
+abstract class StubActivity : Activity() {
 
-    private const val TAG = "PineHookManager"
-    private const val CONTAINER_PACKAGE = "com.fesu.renjana"
+    companion object {
+        private const val TAG = "StubActivity"
 
-    private val hookedPackages = mutableSetOf<Pair<String, String>>()
-
-    @Volatile
-    private var initialized = false
-
-    @Volatile
-    private var pineAvailable = false
-
-    private var hooksInstalled = 0
-
-    fun initialize(): Boolean {
-        if (initialized) {
-            return pineAvailable
-        }
-
-        try {
-            unsealHiddenApi()
-
-            pineAvailable = try {
-                val pineClass = Class.forName("top.canyie.pine.Pine")
-                try {
-                    pineClass.getMethod("is64Bit").invoke(null)
-                } catch (e: UnsatisfiedLinkError) {
-                    RenjanaLog.w(TAG, "Pine native lib unavailable (x86?): ${e.message}")
-                    pineAvailable = false
-                    return false
-                }
-                true
-            } catch (e: Throwable) {
-                RenjanaLog.w(TAG, "Pine library not available: ${e.message}")
-                false
-            }
-
-            if (!pineAvailable) {
-                initialized = true
-                return false
-            }
-
-            RenjanaLog.i(TAG, "Initializing Pine hook manager (non-root mode)")
-
-            PineConfig.debug = false
-            PineConfig.debuggable = false
-
-            installSystemHooks()
-            initialized = true
-            RenjanaLog.i(TAG, "Pine hook manager initialized successfully")
-            return true
-        } catch (e: Throwable) {
-            RenjanaLog.e(TAG, "Pine initialization failed: ${e.message}")
-            initialized = true
-            return false
-        }
+        const val EXTRA_GUEST_ACTIVITY_CLASS = "stub_guest_class"
+        const val EXTRA_INSTANCE_ID = "stub_instance_id"
+        const val EXTRA_APK_PATH = "stub_apk_path"
+        const val EXTRA_DATA_PATH = "stub_data_path"
+        const val EXTRA_PACKAGE_NAME = "stub_package_name"
+        const val EXTRA_APP_NAME = "stub_app_name"
+        const val EXTRA_ACCOUNT_ID = "stub_account_id"
+        const val EXTRA_ENABLE_GMS = "stub_enable_gms"
+        const val EXTRA_ENABLE_FINGERPRINT = "stub_enable_fingerprint"
+        const val EXTRA_SPOOF_SIGNATURE = "stub_spoof_signature"
+        const val EXTRA_ENABLE_ANTI_DETECTION = "stub_enable_anti_detection"
+        const val EXTRA_GUEST_ORIGINAL_INTENT = "stub_guest_intent"
+        const val EXTRA_LAUNCH_MODE = "stub_launch_mode"
+        const val EXTRA_REQUEST_CODE = "stub_request_code"
+        const val EXTRA_STUB_INDEX = "stub_index"
+        const val ACTION_FINISH_GUEST = "com.fesu.renjana.action.FINISH_GUEST"
     }
 
-    fun isAvailable(): Boolean = pineAvailable
+    abstract fun getStubIndex(): Int
 
-    private fun unsealHiddenApi() {
+    private var guestActivity: Activity? = null
+    private var virtualClassLoader: VirtualClassLoader? = null
+    private var guestClassName: String = ""
+    private var instanceId: String = ""
+    private var guestPackageName: String = ""
+    private var guestApplication: Application? = null
+    private var guestActivityInfo: android.content.pm.ActivityInfo? = null
+    private var effectiveGuestTheme: Int = 0
+    private var virtualContext: VirtualContext? = null
+
+    private var onCreateMethod: Method? = null
+    private var onStartMethod: Method? = null
+    private var onResumeMethod: Method? = null
+    private var onPauseMethod: Method? = null
+    private var onStopMethod: Method? = null
+    private var onDestroyMethod: Method? = null
+    private var onRestartMethod: Method? = null
+    private var onNewIntentMethod: Method? = null
+    private var onActivityResultMethod: Method? = null
+    private var onSaveInstanceStateMethod: Method? = null
+    private var onRestoreInstanceStateMethod: Method? = null
+    private var onBackPressedMethod: Method? = null
+    private var onKeyDownMethod: Method? = null
+    private var onKeyUpMethod: Method? = null
+    private var onTouchEventMethod: Method? = null
+    private var onCreateOptionsMenuMethod: Method? = null
+    private var onOptionsItemSelectedMethod: Method? = null
+    private var onRequestPermissionsResultMethod: Method? = null
+    private var onConfigurationChangedMethod: Method? = null
+    private var onWindowFocusChangedMethod: Method? = null
+
+    override fun attachBaseContext(newBase: Context?) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                HiddenApiBypass.addHiddenApiExemptions("")
-                RenjanaLog.i(TAG, "Hidden API restrictions unsealed via HiddenApiBypass")
+            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
+        } catch (_: Throwable) {}
+
+        val instanceId = intent?.getStringExtra(EXTRA_INSTANCE_ID)
+        val dataPath = intent?.getStringExtra(EXTRA_DATA_PATH)
+            ?: (instanceId?.let { ActivityStubManager.getDataPathForInstance(it) })
+        if (instanceId != null && dataPath != null && newBase != null) {
+            try {
+                super.attachBaseContext(VirtualContext(newBase, dataPath))
+                RenjanaLog.d(TAG, "attachBaseContext: wrapped with VirtualContext for instance $instanceId")
                 return
+            } catch (e: Exception) {
+                RenjanaLog.w(TAG, "attachBaseContext: failed to wrap context: ${e.message}")
             }
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "HiddenApiBypass failed, trying fallback: ${e.message}")
+        }
+        super.attachBaseContext(newBase)
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        if (intent?.action == ACTION_FINISH_GUEST) {
+            RenjanaLog.i(TAG, "StubActivity[${getStubIndex()}] received FINISH_GUEST — finishing")
+            finish()
+            return
         }
 
         try {
-            val forName = Class::class.java.getDeclaredMethod("forName", String::class.java)
-            val getDeclaredMethod = Class::class.java.getDeclaredMethod(
-                "getDeclaredMethod", String::class.java, arrayOf<Class<*>>()::class.java
-            )
-            val vmRuntimeClass = forName.invoke(null, "dalvik.system.VMRuntime") as Class<*>
-            val getRuntime = getDeclaredMethod.invoke(vmRuntimeClass, "getRuntime", null) as Method
-            val setHiddenApiExemptions = getDeclaredMethod.invoke(
-                vmRuntimeClass, "setHiddenApiExemptions", arrayOf(arrayOf<String>()::class.java)
-            ) as Method
-            val runtime = getRuntime.invoke(null)
-            setHiddenApiExemptions.invoke(runtime, arrayOf("L"))
-            RenjanaLog.i(TAG, "Hidden API restrictions unsealed")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Hidden API unseal failed: ${e.message}")
-        }
-    }
+            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(false)
+        } catch (_: Throwable) {}
 
-    fun installGuestHooks(
-        packageName: String,
-        classLoader: ClassLoader,
-        instanceId: String,
-        dataPath: String,
-        apkPath: String? = null,
-        instance: Instance? = null
-    ): Boolean {
-        if (!pineAvailable) {
-            RenjanaLog.w(TAG, "Pine not available, cannot install guest hooks")
-            return false
+        instanceId = intent.getStringExtra(EXTRA_INSTANCE_ID).orEmpty()
+        guestPackageName = intent.getStringExtra(EXTRA_PACKAGE_NAME).orEmpty()
+        guestClassName = intent.getStringExtra(EXTRA_GUEST_ACTIVITY_CLASS).orEmpty()
+        val apkPath = intent.getStringExtra(EXTRA_APK_PATH).orEmpty()
+        val dataPath = intent.getStringExtra(EXTRA_DATA_PATH).orEmpty().ifEmpty {
+            ActivityStubManager.getDataPathForInstance(instanceId).orEmpty()
+        }
+        val packageName = intent.getStringExtra(EXTRA_PACKAGE_NAME).orEmpty().ifEmpty {
+            ActivityStubManager.getCachedInstance(instanceId)?.packageName.orEmpty()
+        }
+        val appName = intent.getStringExtra(EXTRA_APP_NAME).orEmpty()
+        val accountId = intent.getStringExtra(EXTRA_ACCOUNT_ID)
+        val enableGms = intent.getBooleanExtra(EXTRA_ENABLE_GMS, false)
+        val enableFingerprint = intent.getBooleanExtra(EXTRA_ENABLE_FINGERPRINT, true)
+        val spoofSignature = intent.getBooleanExtra(EXTRA_SPOOF_SIGNATURE, true)
+        val enableAntiDetection = intent.getBooleanExtra(EXTRA_ENABLE_ANTI_DETECTION, true)
+
+        if (instanceId.isEmpty() || guestClassName.isEmpty() || apkPath.isEmpty()) {
+            RenjanaLog.e(TAG, "Missing required extras: instanceId=$instanceId, guest=$guestClassName, apk=$apkPath")
+            finish()
+            return
         }
 
-        CoreHooks.classLoaderToInstanceId[classLoader] = instanceId
+        try {
+            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
+        } catch (_: Throwable) {}
 
-        synchronized(hookedPackages) {
-            if (hookedPackages.contains(instanceId to packageName)) {
-                CoreHooks.classLoaderToInstanceId[classLoader] = instanceId
-                RenjanaLog.d(TAG, "Package $packageName already hooked; registered new classloader for instance $instanceId")
-                return true
+        RenjanaLog.i(TAG, "StubActivity[${getStubIndex()}] onCreate (pid=${android.os.Process.myPid()}) → launching guest $guestClassName for instance $instanceId")
+
+        ActivityStubManager.onStubOccupied(instanceId, getStubIndex(), guestClassName)
+
+        try {
+            CoreHooks.currentInstanceId.set(instanceId)
+
+            val baseDataPath = dataPath.ifEmpty {
+                "${filesDir.parent}/instances/$instanceId"
+            }
+            val effectiveDataPath = if (packageName.isNotBlank()) {
+                "$baseDataPath/packages/$packageName"
+            } else {
+                baseDataPath
             }
 
-            RenjanaLog.i(TAG, "Installing Pine guest hooks for: $packageName (instance=$instanceId)")
+            val resolvedPackageName = packageName.ifEmpty { null }
+            virtualContext = VirtualContext(this, effectiveDataPath, resolvedPackageName)
+
+            val optimizedDir = java.io.File(effectiveDataPath, "dex_opt").apply { mkdirs() }
+            val guestNativeLibDir = resolveGuestNativeLibDir(apkPath, packageName, effectiveDataPath)
+            virtualClassLoader = VirtualClassLoader(
+                apkPath = apkPath,
+                instanceId = instanceId,
+                optimizedDir = optimizedDir,
+                guestPackageName = packageName,
+                nativeLibDir = guestNativeLibDir,
+                parent = classLoader
+            )
 
             try {
-                val appDataPath = "$dataPath/$packageName"
-                File(appDataPath).apply {
-                    listOf("files", "databases", "shared_prefs", "cache", "code_cache", "dex_opt")
-                        .forEach { File(this, it).mkdirs() }
-                }
-                CoreHooks.registerPackage(packageName, appDataPath, instanceId)
-                CoreHooks.registerClassLoader(classLoader, instanceId)
-                CoreHooks.currentInstanceId.set(instanceId)
+                virtualContext?.guestResources = virtualClassLoader!!.getResources(this)
+            } catch (_: Throwable) {}
 
-                if (instance != null) {
-                    CoreHooks.registerInstanceConfig(instanceId, instance.config)
-                }
+            val launchInfo = ApkLoader(this).getGuestLaunchInfo(apkPath, guestClassName)
+            guestActivityInfo = launchInfo.activityInfo
+            effectiveGuestTheme = launchInfo.activityInfo?.theme?.takeIf { it != 0 }
+                ?: launchInfo.applicationTheme.takeIf { it != 0 }
+                ?: 0
 
+            val baseInstance = ActivityStubManager.getCachedInstance(instanceId)
+            val effectivePackage = packageName.ifEmpty { launchInfo.packageName ?: baseInstance?.packageName ?: "com.example.guest" }
+            val effectiveAppName = appName.ifEmpty { baseInstance?.appName ?: "Guest App" }
+            val instance = baseInstance?.copy(
+                packageName = effectivePackage,
+                appName = effectiveAppName,
+                dataPath = effectiveDataPath
+            ) ?: Instance(
+                id = instanceId,
+                packageName = effectivePackage,
+                appName = effectiveAppName,
+                versionName = "1.0",
+                versionCode = 1,
+                apkPath = apkPath,
+                iconPath = null,
+                accountId = accountId,
+                dataPath = effectiveDataPath,
+                createdAt = System.currentTimeMillis(),
+                lastUsed = System.currentTimeMillis(),
+                isActive = true,
+                config = com.fesu.renjana.models.InstanceConfig(
+                    enableGms = enableGms,
+                    enableFingerprint = enableFingerprint,
+                    spoofSignature = spoofSignature,
+                    enableAntiDetection = enableAntiDetection
+                )
+            )
+
+            if (PineHookManager.isAvailable()) {
+                PineHookManager.installGuestHooks(
+                    effectivePackage,
+                    virtualClassLoader!!,
+                    instanceId,
+                    effectiveDataPath,
+                    apkPath,
+                    instance = instance
+                )
+            }
+
+            val assignedAccountId = accountId
+            if (instance.config.enableGms && assignedAccountId != null) {
                 try {
-                    DeviceFingerprint.initialize(RenjanaApplication.get())
+                    com.fesu.renjana.RenjanaApplication.get().applicationScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        com.fesu.renjana.RenjanaApplication.get().googleSignInVirtualizer
+                            .assignAccountToInstance(instanceId, assignedAccountId)
+                    }
                 } catch (e: Throwable) {
-                    RenjanaLog.w(TAG, "DeviceFingerprint.initialize failed (non-fatal): ${e.message}")
+                    RenjanaLog.w(TAG, "GMS account assignment failed: ${e.message}")
                 }
+            }
 
-                val config = instance?.config
-                if (config == null || config.enableAntiDetection) {
-                    AntiDetection.initialize(instanceId, dataPath)
-                    FridaDetectionEvasion.initialize(instanceId)
+            if (instance.config.enableFingerprint) {
+                com.fesu.renjana.hooks.DeviceFingerprint.applyDeviceSpoofToProcess(instance.config, instanceId)
+            }
+
+            bypassVectorDrawableCheck()
+
+            guestApplication = createAndAttachGuestApplication(launchInfo.applicationClass)
+            virtualContext?.guestApplication = guestApplication
+            runGuestProviders(launchInfo.providers)
+            guestApplication?.let { app ->
+                try {
+                    app.onCreate()
+                    RenjanaLog.i(TAG, "Guest Application started: ${launchInfo.applicationClass}")
+                } catch (e: Throwable) {
+                    RenjanaLog.w(TAG, "Guest Application.onCreate failed (non-fatal): ${e.message}")
                 }
-                if (config != null && config.enableSafetyNetBypass) {
-                    SafetyNetBypass.initialize(instanceId)
-                    PlayIntegrityBypass.initialize(instanceId, packageName)
+            }
+
+            val guestClass = virtualClassLoader!!.loadGuestClass(guestClassName)
+            guestActivity = guestClass.getDeclaredConstructor().newInstance() as Activity
+
+            cacheLifecycleMethods(guestClass)
+            attachGuestToHost()
+
+            guestActivity?.let { guest ->
+                try {
+                    com.fesu.renjana.hooks.ActivityStarterHook.cacheInstanceInfo(
+                        instanceId, apkPath,
+                        packageName.ifEmpty { launchInfo.packageName ?: "com.example.guest" }
+                    )
+                    com.fesu.renjana.hooks.ActivityStarterHook.installForActivity(this, guest, instanceId)
+                } catch (e: Throwable) {
+                    RenjanaLog.w(TAG, "ActivityStarterHook install failed (non-fatal): ${e.message}")
                 }
+            }
 
-                hooksInstalled = 0
+            val guestIntent = intent.getParcelableExtra<Intent>(EXTRA_GUEST_ORIGINAL_INTENT)
+            if (guestIntent != null) {
+                setGuestIntent(guestIntent)
+            }
 
-                val resolvedApkPath = apkPath ?: resolveApkPath(dataPath, classLoader)
-                if (resolvedApkPath != null) {
-                    GuestInfoCache.cache(instanceId, packageName, resolvedApkPath)
-                    SignatureSpoof.storeOriginalSignatures(packageName, resolvedApkPath)
-                } else {
-                    RenjanaLog.w(TAG, "Could not resolve APK path for $packageName; GuestInfoCache skipped")
-                }
+            reportStateToService(InstanceNotificationManager.ACTION_OPEN_INSTANCE)
 
-                hookActivityThread()
-                hookActivityPerformCreate()
-                hookPackageManager(classLoader)
-                hookGoogleSignIn(classLoader)
-                hookSharedPreferences()
-                hookFileConstructors()
-                hookFileExists()
-                hookSystemGetProperty()
-                hookSystemPropertiesGet()
+            if (onCreateMethod != null) {
+                onCreateMethod!!.invoke(guestActivity, savedInstanceState)
+            } else {
+                RenjanaLog.w(TAG, "Guest $guestClassName has no onCreate method")
+            }
 
-                // Avoid hooking ART core reflection intrinsics on Android 14/15 (causes SIGSEGV)
-                if (Build.VERSION.SDK_INT < 34) {
-                    hookGetStackTrace()
-                    hookClassForName()
-                }
-                hookProcMaps()
+        } catch (e: Throwable) {
+            val cause = e.cause ?: e
+            RenjanaLog.e(TAG, "Failed to launch guest $guestClassName: ${cause.message}", cause)
+            try {
+                Toast.makeText(this, "Launch error: ${cause.javaClass.simpleName}: ${cause.message}", Toast.LENGTH_LONG).show()
+            } catch (_: Throwable) {}
+            finish()
+        }
+    }
 
-                if (instance != null && instance.config.enableFingerprint) {
-                    hookFingerprintHooks()
-                }
-
-                hookNotifications()
-
-                if (GoogleSignInHook.installHooks(classLoader, instanceId)) {
-                    hooksInstalled++
-                }
-
-                if (instance == null || !instance.config.enableGms) {
-                    if (installGmsUnavailableHooks(classLoader)) {
-                        hooksInstalled++
+    private fun resolveGuestNativeLibDir(apkPath: String, packageName: String, dataPath: String): String? {
+        try {
+            if (packageName.isNotBlank()) {
+                val installed = packageManager.getApplicationInfo(packageName, 0).nativeLibraryDir
+                if (!installed.isNullOrBlank()) {
+                    val dir = java.io.File(installed)
+                    if (dir.isDirectory && dir.listFiles()?.isNotEmpty() == true) {
+                        return installed
                     }
-                    try {
-                        val contextImplClass = Class.forName("android.app.ContextImpl")
-                        for (m in contextImplClass.declaredMethods) {
-                            if (!m.name.startsWith("bindService")) continue
-                            if (!m.parameterTypes.contains(Intent::class.java)) continue
-                            if (m.returnType != Boolean::class.javaPrimitiveType) continue
-                            if (safeHook(m, CoreHooks.createBindServiceGmsBlockHook(), "ContextImpl.${m.name}")) {
-                                hooksInstalled++
-                            }
+                }
+            }
+        } catch (_: Throwable) {}
+
+        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        val libDir = java.io.File(dataPath, "lib").apply { mkdirs() }
+        var sawAny = false
+        for (apk in VirtualClassLoader.resolveAllApkPaths(apkPath)) {
+            try {
+                java.util.zip.ZipFile(apk).use { zip ->
+                    val entries = zip.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        if (entry.isDirectory) continue
+                        if (!entry.name.startsWith("lib/$abi/") || !entry.name.endsWith(".so")) continue
+                        sawAny = true
+                        val out = java.io.File(libDir, java.io.File(entry.name).name)
+                        if (out.exists() && out.length() == entry.size) continue
+                        zip.getInputStream(entry).use { input ->
+                            java.io.FileOutputStream(out).use { output -> input.copyTo(output) }
                         }
-                    } catch (e: Throwable) {
-                        RenjanaLog.w(TAG, "Failed to hook bindService: ${e.message}")
-                    }
-                }
-
-                if (hooksInstalled == 0) {
-                    RenjanaLog.w(TAG, "Zero hooks installed despite Pine available")
-                    return false
-                }
-
-                hookedPackages.add(instanceId to packageName)
-                RenjanaLog.i(TAG, "Pine guest hooks installed for $packageName")
-                return hooksInstalled > 0
-            } catch (e: Throwable) {
-                RenjanaLog.e(TAG, "Failed to install Pine guest hooks for $packageName: ${e.message}")
-                return false
-            }
-        }
-    }
-
-    fun uninstallGuestHooks(packageName: String, instanceId: String) {
-        synchronized(hookedPackages) {
-            if (!hookedPackages.contains(instanceId to packageName)) return
-
-            RenjanaLog.i(TAG, "Uninstalling Pine guest hooks for: $packageName")
-
-            try {
-                CoreHooks.unregisterPackage(packageName)
-                CoreHooks.currentInstanceId.remove()
-                GuestInfoCache.clear(instanceId, packageName)
-                AntiDetection.cleanup(instanceId)
-                DeviceFingerprint.cleanup(instanceId)
-                CoreHooks.instanceConfigs.remove(instanceId)
-                hookedPackages.remove(instanceId to packageName)
-                RenjanaLog.i(TAG, "Pine guest hooks uninstalled for $packageName")
-            } catch (e: Throwable) {
-                RenjanaLog.e(TAG, "Failed to uninstall Pine guest hooks: ${e.message}")
-            }
-        }
-    }
-
-    private fun installGmsUnavailableHooks(classLoader: ClassLoader): Boolean {
-        val availabilityClasses = listOf(
-            "com.google.android.gms.common.GoogleApiAvailability",
-            "com.google.android.gms.common.GoogleApiAvailabilityLight",
-            "com.google.android.gms.common.GooglePlayServicesUtil"
-        )
-        var installed = 0
-        val replacement = object : de.robv.android.xposed.XC_MethodReplacement() {
-            override fun replaceHookedMethod(param: XC_MethodHook.MethodHookParam): Any = 1
-        }
-        for (className in availabilityClasses) {
-            try {
-                val clazz = XposedHelpers.findClass(className, classLoader)
-                for (method in clazz.declaredMethods) {
-                    if (method.returnType != Int::class.javaPrimitiveType) continue
-                    if (!method.name.contains("GooglePlayServicesAvailable", ignoreCase = true)) continue
-                    if (safeHook(method, replacement, "$className.${method.name}")) {
-                        installed++
                     }
                 }
             } catch (_: Throwable) {}
         }
-        RenjanaLog.i(TAG, "GMS marked unavailable for guest ($installed availability hooks)")
-        return installed > 0
+        RenjanaLog.i(TAG, if (sawAny) "Guest native lib dir: ${libDir.absolutePath}" else "No guest native libs found for abi=$abi")
+        return if (sawAny) libDir.absolutePath else null
     }
 
-    private fun safeHook(method: Member?, hook: XC_MethodHook, label: String): Boolean {
-        if (method == null) {
-            RenjanaLog.w(TAG, "Target method not found, skipping hook: $label")
-            return false
-        }
+    private fun createAndAttachGuestApplication(applicationClass: String?): Application? {
+        val className = applicationClass?.takeIf { it.isNotBlank() } ?: return null
         return try {
-            XposedBridge.hookMethod(method, hook)
-            hooksInstalled++
-            RenjanaLog.d(TAG, "Hook installed: $label")
-            true
+            val clazz = virtualClassLoader!!.loadGuestClass(className)
+            val app = clazz.getDeclaredConstructor().newInstance() as Application
+
+            val attachMethod = Application::class.java.declaredMethods.firstOrNull {
+                it.name == "attach" && it.parameterCount == 1 &&
+                    Context::class.java.isAssignableFrom(it.parameterTypes[0])
+            } ?: throw NoSuchMethodException("Application.attach(Context) not found")
+            attachMethod.isAccessible = true
+            attachMethod.invoke(app, virtualContext)
+            RenjanaLog.i(TAG, "Guest Application attached: $className")
+            app
         } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook $label: ${e.message}")
-            false
-        }
-    }
-
-    private fun installSystemHooks() {
-        RenjanaLog.d(TAG, "Installing Pine system hooks")
-        try {
-            hookBuildField("SERIAL", "unknown")
-            hookBuildField("TAGS", "release-keys")
-            RenjanaLog.i(TAG, "Pine system hooks installed successfully")
-        } catch (e: Throwable) {
-            RenjanaLog.e(TAG, "Failed to install Pine system hooks: ${e.message}")
-        }
-    }
-
-    private fun hookBuildField(fieldName: String, spoofedValue: String) {
-        try {
-            val buildClass = Class.forName("android.os.Build")
-            val field = buildClass.getDeclaredField(fieldName)
-            field.isAccessible = true
-            field.set(null, spoofedValue)
-            RenjanaLog.d(TAG, "Spoofed Build.$fieldName = $spoofedValue via Pine")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to spoof Build.$fieldName: ${e.message}")
-        }
-    }
-
-    private fun hookActivityThread() {
-        val method = findActivityThreadMethod("handleLaunchActivity")
-        safeHook(method, CoreHooks.createActivityThreadHook(), "ActivityThread.handleLaunchActivity")
-    }
-
-    private fun hookActivityPerformCreate() {
-        try {
-            val method = Activity::class.java.getDeclaredMethod(
-                "performCreate", Bundle::class.java
-            )
-            safeHook(method, CoreHooks.createActivityPerformCreateHook(), "Activity.performCreate")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Activity.performCreate not found: ${e.message}")
-        }
-    }
-
-    private fun hookPackageManager(@Suppress("UNUSED_PARAMETER") classLoader: ClassLoader) {
-        try {
-            val appPmClass = Class.forName("android.app.ApplicationPackageManager")
-
-            val getPackageInfo = appPmClass.getDeclaredMethod(
-                "getPackageInfo", String::class.java, Int::class.javaPrimitiveType
-            )
-            safeHook(getPackageInfo, CoreHooks.createGetPackageInfoHook(),
-                "ApplicationPackageManager.getPackageInfo")
-
-            try {
-                val versionedPackageClass = Class.forName("android.content.pm.VersionedPackage")
-                val getPackageInfoVersioned = appPmClass.getDeclaredMethod(
-                    "getPackageInfo", versionedPackageClass, Int::class.javaPrimitiveType
-                )
-                safeHook(getPackageInfoVersioned, CoreHooks.createGetPackageInfoVersionedHook(),
-                    "ApplicationPackageManager.getPackageInfo(VersionedPackage)")
-            } catch (_: Throwable) {}
-
-            try {
-                val packageInfoFlagsClass = Class.forName("android.content.pm.PackageManager\$PackageInfoFlags")
-                val getPackageInfoFlags = appPmClass.getDeclaredMethod(
-                    "getPackageInfo", String::class.java, packageInfoFlagsClass
-                )
-                safeHook(getPackageInfoFlags, CoreHooks.createGetPackageInfoFlagsHook(),
-                    "ApplicationPackageManager.getPackageInfo(PackageInfoFlags)")
-            } catch (_: Throwable) {}
-
-            val getInstalledPackages = appPmClass.getDeclaredMethod(
-                "getInstalledPackages", Int::class.javaPrimitiveType
-            )
-            safeHook(getInstalledPackages, CoreHooks.createGetInstalledPackagesHook(),
-                "ApplicationPackageManager.getInstalledPackages")
-
-            for (m in appPmClass.declaredMethods) {
-                when (m.name) {
-                    "getApplicationInfo", "getApplicationInfoAsUser" ->
-                        safeHook(m, CoreHooks.createGetApplicationInfoHook(),
-                            "ApplicationPackageManager.${m.name}")
-                    "getPackagesForUid" ->
-                        safeHook(m, CoreHooks.createGetPackagesForUidHook(),
-                            "ApplicationPackageManager.getPackagesForUid")
-                }
-            }
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook PackageManager: ${e.message}")
-        }
-    }
-
-    private fun hookGoogleSignIn(classLoader: ClassLoader) {
-        try {
-            val googleSignInClass = classLoader.loadClass(
-                "com.google.android.gms.auth.api.signin.GoogleSignIn"
-            )
-            val getSignedInAccountFromIntent = googleSignInClass.getDeclaredMethod(
-                "getSignedInAccountFromIntent", Intent::class.java
-            )
-            safeHook(getSignedInAccountFromIntent, CoreHooks.createGoogleSignInHook(),
-                "GoogleSignIn.getSignedInAccountFromIntent")
-        } catch (_: Throwable) {}
-
-        try {
-            val accountClass = classLoader.loadClass(
-                "com.google.android.gms.auth.api.signin.GoogleSignInAccount"
-            )
-            val constructors = accountClass.declaredConstructors
-            if (constructors.isNotEmpty()) {
-                safeHook(constructors[0], CoreHooks.createGoogleSignInAccountHook(),
-                    "GoogleSignInAccount.<init>")
-            }
-        } catch (_: Throwable) {}
-    }
-
-    private fun hookSharedPreferences() {
-        try {
-            val contextImplClass = Class.forName("android.app.ContextImpl")
-            val method = contextImplClass.getDeclaredMethod(
-                "getSharedPreferences", String::class.java, Int::class.javaPrimitiveType
-            )
-            safeHook(method, CoreHooks.createSharedPreferencesHook(),
-                "ContextImpl.getSharedPreferences")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook getSharedPreferences: ${e.message}")
-        }
-    }
-
-    private fun hookFileConstructors() {
-        try {
-            val ctor1 = File::class.java.getDeclaredConstructor(String::class.java)
-            safeHook(ctor1, CoreHooks.createFileConstructorHook(), "File(String)")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook File(String): ${e.message}")
-        }
-
-        try {
-            val ctor2 = File::class.java.getDeclaredConstructor(
-                String::class.java, String::class.java
-            )
-            safeHook(ctor2, CoreHooks.createFileConstructor2Hook(), "File(String, String)")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook File(String, String): ${e.message}")
-        }
-    }
-
-    private fun hookFileExists() {
-        try {
-            val method = File::class.java.getDeclaredMethod("exists")
-            safeHook(method, CoreHooks.createFileExistsHook(), "File.exists")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook File.exists: ${e.message}")
-        }
-    }
-
-    private fun hookSystemGetProperty() {
-        try {
-            val method = System::class.java.getDeclaredMethod(
-                "getProperty", String::class.java
-            )
-            safeHook(method, CoreHooks.createSystemGetPropertyHook(), "System.getProperty")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook System.getProperty: ${e.message}")
-        }
-    }
-
-    private fun hookSystemPropertiesGet() {
-        try {
-            val sysPropsClass = Class.forName("android.os.SystemProperties")
-            val method = sysPropsClass.getDeclaredMethod(
-                "get", String::class.java, String::class.java
-            )
-            safeHook(method, CoreHooks.createSystemPropertiesGetHook(),
-                "SystemProperties.get")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook SystemProperties.get: ${e.message}")
-        }
-    }
-
-    private fun hookGetStackTrace() {
-        try {
-            val method = Thread::class.java.getDeclaredMethod("getStackTrace")
-            safeHook(method, CoreHooks.createGetStackTraceHook(), "Thread.getStackTrace")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook Thread.getStackTrace: ${e.message}")
-        }
-    }
-
-    private fun hookClassForName() {
-        try {
-            val method = Class::class.java.getDeclaredMethod(
-                "forName", String::class.java,
-                Boolean::class.javaPrimitiveType, ClassLoader::class.java
-            )
-            safeHook(method, CoreHooks.createClassForNameHook(), "Class.forName")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook Class.forName: ${e.message}")
-        }
-    }
-
-    private fun hookProcMaps() {
-        try {
-            val method = java.io.FileInputStream::class.java.getDeclaredConstructor(
-                String::class.java
-            )
-            safeHook(method, CoreHooks.createProcMapsHook(), "FileInputStream(String)")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook FileInputStream(String) for /proc/maps: ${e.message}")
-        }
-
-        try {
-            val method = java.io.FileReader::class.java.getDeclaredConstructor(
-                String::class.java
-            )
-            safeHook(method, CoreHooks.createProcMapsHook(), "FileReader(String)")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook FileReader(String) for /proc/maps: ${e.message}")
-        }
-    }
-
-    private fun hookFingerprintHooks() {
-        try {
-            val method = android.provider.Settings.Secure::class.java.getDeclaredMethod(
-                "getString",
-                android.content.ContentResolver::class.java,
-                String::class.java
-            )
-            safeHook(method, CoreHooks.createAndroidIdHook(), "Settings.Secure.getString")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook Settings.Secure.getString: ${e.message}")
-        }
-
-        try {
-            val tmClass = TelephonyManager::class.java
-
-            val getDeviceId = tmClass.getDeclaredMethod("getDeviceId")
-            safeHook(getDeviceId, CoreHooks.createTelephonyHook(), "TelephonyManager.getDeviceId")
-
-            val getImei = tmClass.getDeclaredMethod("getImei", Int::class.javaPrimitiveType)
-            safeHook(getImei, CoreHooks.createTelephonyHook(), "TelephonyManager.getImei")
-
-            val getSubscriberId = tmClass.getDeclaredMethod("getSubscriberId")
-            safeHook(getSubscriberId, CoreHooks.createTelephonyHook(), "TelephonyManager.getSubscriberId")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook TelephonyManager: ${e.message}")
-        }
-
-        // Skip Field.get hook on Android 14/15 because hooking java.lang.reflect.Field.get
-        // crashes ART 15; DeviceFingerprint.applyDeviceSpoofToProcess already mutates Build fields.
-        if (Build.VERSION.SDK_INT < 34) {
-            try {
-                val method = java.lang.reflect.Field::class.java.getDeclaredMethod(
-                    "get", Any::class.java
-                )
-                safeHook(method, CoreHooks.createBuildFieldHook(), "Field.get")
-            } catch (e: Throwable) {
-                RenjanaLog.w(TAG, "Failed to hook Field.get for Build fields: ${e.message}")
-            }
-        }
-    }
-
-    private fun hookNotifications() {
-        try {
-            val nmClass = android.app.NotificationManager::class.java
-            val hook = CoreHooks.createNotificationHook()
-
-            val notifyById = nmClass.getDeclaredMethod(
-                "notify",
-                Int::class.javaPrimitiveType,
-                android.app.Notification::class.java
-            )
-            safeHook(notifyById, hook, "NotificationManager.notify(int,Notification)")
-
-            val notifyByTag = nmClass.getDeclaredMethod(
-                "notify",
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                android.app.Notification::class.java
-            )
-            safeHook(notifyByTag, hook, "NotificationManager.notify(String,int,Notification)")
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "Failed to hook NotificationManager.notify: ${e.message}")
-        }
-    }
-
-    private fun findActivityThreadMethod(name: String): Method? {
-        return try {
-            val activityThreadClass = Class.forName("android.app.ActivityThread")
-            for (method in activityThreadClass.declaredMethods) {
-                if (method.name == name) {
-                    return method
-                }
-            }
-            null
-        } catch (e: Throwable) {
-            RenjanaLog.w(TAG, "ActivityThread.$name not found: ${e.message}")
+            RenjanaLog.w(TAG, "Guest Application could not start (continuing): ${e.message}", e)
             null
         }
     }
 
-    private fun resolveApkPath(dataPath: String, classLoader: ClassLoader): String? {
-        val candidates = listOf(
-            File(dataPath, "base.apk"),
-            File(dataPath, "source.apk"),
-            File(dataPath, "app.apk")
-        )
-        for (candidate in candidates) {
-            if (candidate.exists() && candidate.isFile) {
-                return candidate.absolutePath
+    private fun runGuestProviders(providers: List<android.content.pm.ProviderInfo>) {
+        val context = virtualContext ?: return
+        for (providerInfo in providers) {
+            try {
+                val clazz = virtualClassLoader!!.loadGuestClass(providerInfo.name)
+                val provider = clazz.getDeclaredConstructor().newInstance() as android.content.ContentProvider
+                provider.attachInfo(context, providerInfo)
+                RenjanaLog.d(TAG, "Guest provider started: ${providerInfo.name}")
+            } catch (e: Throwable) {
+                RenjanaLog.w(TAG, "Guest provider failed (non-fatal): ${providerInfo.name}: ${e.message}", e)
             }
         }
+    }
 
-        val dataFile = File(dataPath)
-        if (dataFile.isFile && dataFile.name.endsWith(".apk")) {
-            return dataFile.absolutePath
-        }
-
+    private fun attachGuestToHost() {
+        val guest = guestActivity ?: return
         try {
-            val dexClField = classLoader.javaClass.getDeclaredField("dexClassLoader")
-            dexClField.isAccessible = true
-            val dexCl = dexClField.get(classLoader) as? DexClassLoader
-            if (dexCl != null) {
-                val baseClClass = Class.forName("dalvik.system.BaseDexClassLoader")
-                val pathListField = baseClClass.getDeclaredField("pathList")
-                pathListField.isAccessible = true
-                val pathList = pathListField.get(dexCl) ?: return null
+            attachGuestToHost(guest, guestClassName)
+        } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest attach failed (non-fatal): ${e.message}")
+            finish()
+            return
+        }
+    }
 
-                val dexElementsField = pathList.javaClass.getDeclaredField("dexElements")
-                dexElementsField.isAccessible = true
-                @Suppress("UNCHECKED_CAST")
-                val dexElements = dexElementsField.get(pathList) as? Array<Any> ?: return null
+    private fun attachGuestToHost(guest: Activity, guestClassName: String) {
+        try {
+            val resolvedInfo = guestActivityInfo ?: try {
+                val actInfoField = Activity::class.java.getDeclaredField("mActivityInfo")
+                actInfoField.isAccessible = true
+                (actInfoField.get(this) as? android.content.pm.ActivityInfo)?.let { original ->
+                    android.content.pm.ActivityInfo(original).apply { name = guestClassName }
+                } ?: android.content.pm.ActivityInfo().apply {
+                    packageName = this@StubActivity.packageName
+                    name = guestClassName
+                }
+            } catch (_: Throwable) {
+                android.content.pm.ActivityInfo().apply {
+                    packageName = this@StubActivity.packageName
+                    name = guestClassName
+                }
+            }
 
-                for (element in dexElements) {
+            val attachMethod = Activity::class.java.declaredMethods.firstOrNull { it.name == "attach" }
+            if (attachMethod != null) {
+                attachMethod.isAccessible = true
+                val args = arrayOfNulls<Any>(attachMethod.parameterCount)
+                for (i in attachMethod.parameterTypes.indices) {
+                    val type = attachMethod.parameterTypes[i]
+                    args[i] = when {
+                        type == Application::class.java || type.name.contains("Application") ->
+                            guestApplication ?: application
+                        type.name.contains("ActivityThread") -> try {
+                            val f = Activity::class.java.getDeclaredField("mMainThread")
+                            f.isAccessible = true
+                            f.get(this)
+                        } catch (_: Throwable) { null }
+                        type.name.contains("Instrumentation") -> try {
+                            val f = Activity::class.java.getDeclaredField("mInstrumentation")
+                            f.isAccessible = true
+                            f.get(this)
+                        } catch (_: Throwable) { null }
+                        type == android.os.IBinder::class.java -> try {
+                            val f = Activity::class.java.getDeclaredField("mToken")
+                            f.isAccessible = true
+                            f.get(this)
+                        } catch (_: Throwable) { null }
+                        type == Int::class.javaPrimitiveType -> 0
+                        type == Long::class.javaPrimitiveType -> 0L
+                        type == Boolean::class.javaPrimitiveType -> false
+                        type == Intent::class.java -> intent
+                        type == android.content.pm.ActivityInfo::class.java -> resolvedInfo
+                        type == Activity::class.java -> null
+                        type == CharSequence::class.java -> title
+                        type == android.content.res.Configuration::class.java -> resources.configuration
+                        type == android.view.Window::class.java -> null
+                        Context::class.java.isAssignableFrom(type) -> virtualContext ?: this
+                        else -> null
+                    }
+                }
+                attachMethod.invoke(guest, *args)
+                RenjanaLog.i(TAG, "Successfully invoked Activity.attach on $guestClassName")
+            }
+
+            val effectiveApp = guestApplication ?: application
+            var curClass: Class<*>? = guest.javaClass
+            while (curClass != null && curClass != Any::class.java) {
+                val fieldsToSet = listOf(
+                    "mBase" to (virtualContext ?: this),
+                    "mActivityInfo" to resolvedInfo,
+                    "mApplication" to effectiveApp,
+                    "mIntent" to intent,
+                    "mWindowManager" to windowManager,
+                    "mWindow" to window,
+                    "mUiThread" to Thread.currentThread()
+                )
+                for ((fieldName, value) in fieldsToSet) {
                     try {
-                        val dexFileField = element.javaClass.getDeclaredField("dexFile")
-                        dexFileField.isAccessible = true
-                        val dexFile = dexFileField.get(element) ?: continue
-                        val fileNameField = dexFile.javaClass.getDeclaredField("mFileName")
-                        fileNameField.isAccessible = true
-                        val fileName = fileNameField.get(dexFile) as? String ?: continue
-                        if (fileName.endsWith(".apk")) {
-                            return fileName
-                        }
+                        val f = curClass.getDeclaredField(fieldName)
+                        f.isAccessible = true
+                        f.set(guest, value)
                     } catch (_: Throwable) {}
                 }
+                curClass = curClass.superclass
             }
+
+            if (PineHookManager.isAvailable()) {
+                try {
+                    val getAppMethod = Activity::class.java.getDeclaredMethod("getApplication")
+                    top.canyie.pine.Pine.hook(getAppMethod, object : top.canyie.pine.callback.MethodReplacement() {
+                        override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = effectiveApp
+                    })
+                    RenjanaLog.i(TAG, "Pine hooked Activity.getApplication()")
+                } catch (e: Throwable) {
+                    RenjanaLog.w(TAG, "Failed to Pine hook getApplication: ${e.message}")
+                }
+
+                try {
+                    val pmClass = packageManager.javaClass
+                    val safeInfo = resolvedInfo
+                    val targetGuestClass = guestClassName
+                    for (m in pmClass.declaredMethods.filter { it.name == "getActivityInfo" }) {
+                        try {
+                            top.canyie.pine.Pine.hook(m, object : top.canyie.pine.callback.MethodHook() {
+                                override fun beforeCall(callFrame: top.canyie.pine.Pine.CallFrame?) {
+                                    val comp = callFrame?.args?.getOrNull(0) as? android.content.ComponentName
+                                    if (comp != null && (comp.className == targetGuestClass || comp.className.contains(targetGuestClass))) {
+                                        callFrame.result = safeInfo
+                                    }
+                                }
+                            })
+                        } catch (_: Throwable) {}
+                    }
+                    RenjanaLog.i(TAG, "Pine hooked PackageManager.getActivityInfo for $guestClassName")
+                } catch (e: Throwable) {
+                    RenjanaLog.w(TAG, "Failed to Pine hook getActivityInfo: ${e.message}")
+                }
+            }
+
+            try {
+                val compField = Activity::class.java.getDeclaredField("mComponent")
+                compField.isAccessible = true
+                compField.set(guest, this.componentName)
+            } catch (_: Throwable) {}
+
+            try {
+                val guestRes = virtualClassLoader!!.getResources(this)
+                val resField = android.view.ContextThemeWrapper::class.java.getDeclaredField("mResources")
+                resField.isAccessible = true
+                resField.set(guest, guestRes)
+            } catch (_: Throwable) {}
+
+            try {
+                val themeField = android.view.ContextThemeWrapper::class.java.getDeclaredField("mTheme")
+                themeField.isAccessible = true
+                themeField.set(guest, this.theme)
+            } catch (_: Throwable) {}
+
+            if (effectiveGuestTheme != 0) {
+                try {
+                    val themeResField = android.view.ContextThemeWrapper::class.java.getDeclaredField("mThemeResource")
+                    themeResField.isAccessible = true
+                    themeResField.setInt(guest, effectiveGuestTheme)
+                } catch (_: Throwable) {}
+            }
+
+            RenjanaLog.d(TAG, "Guest context injection complete for $guestClassName")
+        } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest context injection partial failure: ${e.message}")
+        }
+    }
+
+    private fun bypassVectorDrawableCheck() {
+        try {
+            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
         } catch (_: Throwable) {}
 
+        virtualClassLoader?.let { vcl ->
+            try {
+                val guestAppCompatDelegate = vcl.loadGuestClass("androidx.appcompat.app.AppCompatDelegate")
+                val setMethod = guestAppCompatDelegate.getMethod("setCompatVectorFromResourcesEnabled", java.lang.Boolean.TYPE)
+                setMethod.invoke(null, true)
+            } catch (_: Throwable) {}
+        }
+
+        listOfNotNull(
+            runCatching { Class.forName("androidx.appcompat.widget.ResourceManagerInternal") }.getOrNull(),
+            runCatching { virtualClassLoader?.loadGuestClass("androidx.appcompat.widget.ResourceManagerInternal") }.getOrNull()
+        ).forEach { rmiClass ->
+            try {
+                val rmiInstance = try {
+                    val getMethod = rmiClass.getDeclaredMethod("get")
+                    getMethod.isAccessible = true
+                    getMethod.invoke(null)
+                } catch (_: Throwable) {
+                    rmiClass.declaredMethods.firstOrNull {
+                        java.lang.reflect.Modifier.isStatic(it.modifiers) && it.returnType == rmiClass && it.parameterCount == 0
+                    }?.let { m ->
+                        m.isAccessible = true
+                        m.invoke(null)
+                    }
+                }
+
+                if (rmiInstance != null) {
+                    rmiClass.declaredFields.filter { it.type == java.lang.Boolean.TYPE }.forEach { field ->
+                        try {
+                            field.isAccessible = true
+                            field.setBoolean(rmiInstance, true)
+                        } catch (_: Throwable) {}
+                    }
+                }
+
+                // Skip Pine hooking ResourceManagerInternal on Android 14/15 to avoid ART crashes
+                if (PineHookManager.isAvailable() && Build.VERSION.SDK_INT < 34) {
+                    rmiClass.declaredMethods.filter {
+                        it.parameterCount == 1 &&
+                        Context::class.java.isAssignableFrom(it.parameterTypes[0]) &&
+                        (it.returnType == java.lang.Void.TYPE || it.returnType == Void.TYPE)
+                    }.forEach { method ->
+                        try {
+                            top.canyie.pine.Pine.hook(method, object : top.canyie.pine.callback.MethodReplacement() {
+                                override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = null
+                            })
+                        } catch (_: Throwable) {}
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun cacheLifecycleMethods(guestClass: Class<*>) {
+        onCreateMethod = safeMethod(guestClass, "onCreate", Bundle::class.java)
+        onStartMethod = safeMethod(guestClass, "onStart")
+        onResumeMethod = safeMethod(guestClass, "onResume")
+        onPauseMethod = safeMethod(guestClass, "onPause")
+        onStopMethod = safeMethod(guestClass, "onStop")
+        onDestroyMethod = safeMethod(guestClass, "onDestroy")
+        onRestartMethod = safeMethod(guestClass, "onRestart")
+        onNewIntentMethod = safeMethod(guestClass, "onNewIntent", Intent::class.java)
+        onActivityResultMethod = safeMethod(
+            guestClass, "onActivityResult",
+            Int::class.javaPrimitiveType!!, Int::class.javaPrimitiveType!!, Intent::class.java
+        )
+        onSaveInstanceStateMethod = safeMethod(guestClass, "onSaveInstanceState", Bundle::class.java)
+        onRestoreInstanceStateMethod = safeMethod(guestClass, "onRestoreInstanceState", Bundle::class.java)
+        onBackPressedMethod = safeMethod(guestClass, "onBackPressed")
+        onKeyDownMethod = safeMethod(
+            guestClass, "onKeyDown",
+            Int::class.javaPrimitiveType!!, KeyEvent::class.java
+        )
+        onKeyUpMethod = safeMethod(
+            guestClass, "onKeyUp",
+            Int::class.javaPrimitiveType!!, KeyEvent::class.java
+        )
+        onTouchEventMethod = safeMethod(guestClass, "onTouchEvent", MotionEvent::class.java)
+        onCreateOptionsMenuMethod = safeMethod(guestClass, "onCreateOptionsMenu", Menu::class.java)
+        onOptionsItemSelectedMethod = safeMethod(guestClass, "onOptionsItemSelected", MenuItem::class.java)
+        onRequestPermissionsResultMethod = safeMethod(
+            guestClass, "onRequestPermissionsResult",
+            Int::class.javaPrimitiveType!!, Array<String>::class.java, IntArray::class.java
+        )
+        onConfigurationChangedMethod = safeMethod(guestClass, "onConfigurationChanged", Configuration::class.java)
+        onWindowFocusChangedMethod = safeMethod(
+            guestClass, "onWindowFocusChanged",
+            Boolean::class.javaPrimitiveType!!
+        )
+    }
+
+    private fun safeMethod(clazz: Class<*>, name: String, vararg params: Class<*>): Method? {
+        var current: Class<*>? = clazz
+        while (current != null) {
+            try {
+                val m = current.getDeclaredMethod(name, *params)
+                m.isAccessible = true
+                return m
+            } catch (_: NoSuchMethodException) {
+                current = current.superclass
+            }
+        }
         return null
     }
 
-    @Deprecated("Use the classLoader passed to installGuestHooks() instead.")
-    fun createGuestClassLoader(packageName: String, dataPath: String): ClassLoader? {
-        return try {
-            val dexPath = File(dataPath, "dex")
-            if (!dexPath.exists() || !dexPath.isDirectory) return null
-
-            val dexFiles = dexPath.listFiles { file -> file.extension == "dex" }
-            if (dexFiles == null || dexFiles.isEmpty()) return null
-
-            dexFiles.forEach { try { it.setReadOnly() } catch (_: Throwable) {} }
-            val dexPathStr = dexFiles.joinToString(File.pathSeparator) { it.absolutePath }
-            val optimizedDir = File(dataPath, "dex_opt").apply { if (!exists()) mkdirs() }
-
-            DexClassLoader(
-                dexPathStr,
-                optimizedDir.absolutePath,
-                null,
-                ClassLoader.getSystemClassLoader()
-            )
-        } catch (e: Throwable) {
-            RenjanaLog.e(TAG, "Failed to create guest ClassLoader for $packageName: ${e.message}")
-            null
+    private fun setGuestIntent(guestIntent: Intent) {
+        try {
+            val intentField = Activity::class.java.getDeclaredField("mIntent")
+            intentField.isAccessible = true
+            intentField.set(guestActivity, guestIntent)
+        } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Failed to set guest intent: ${e.message}")
         }
     }
 
-    fun reset() {
-        CoreHooks.reset()
-        hookedPackages.clear()
-        initialized = false
-        pineAvailable = false
-        RenjanaLog.i(TAG, "PineHookManager state reset")
+    override fun onStart() {
+        super.onStart()
+        try { onStartMethod?.invoke(guestActivity) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onStart failed: ${e.message}")
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ActivityStubManager.onStubResumed(instanceId, getStubIndex())
+        reportStateToService(InstanceNotificationManager.ACTION_OPEN_INSTANCE)
+        try { onResumeMethod?.invoke(guestActivity) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onResume failed: ${e.message}")
+        }
+    }
+
+    override fun onPause() {
+        try { onPauseMethod?.invoke(guestActivity) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onPause failed: ${e.message}")
+        }
+        super.onPause()
+    }
+
+    override fun onStop() {
+        try { onStopMethod?.invoke(guestActivity) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onStop failed: ${e.message}")
+        }
+        super.onStop()
+    }
+
+    override fun onRestart() {
+        super.onRestart()
+        try { onRestartMethod?.invoke(guestActivity) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onRestart failed: ${e.message}")
+        }
+    }
+
+    override fun onDestroy() {
+        try { onDestroyMethod?.invoke(guestActivity) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onDestroy failed: ${e.message}")
+        }
+        ActivityStubManager.onStubReleased(instanceId, getStubIndex(), guestClassName)
+        reportStateToService(InstanceNotificationManager.ACTION_STOP_INSTANCE)
+        guestActivity = null
+        virtualClassLoader = null
+        super.onDestroy()
+
+        if (isFinishing) {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    RenjanaLog.i(TAG, "Cleanly terminating subprocess :p${getStubIndex()} (pid=${android.os.Process.myPid()})")
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                } catch (_: Throwable) {}
+            }, 300)
+        }
+    }
+
+    private fun reportStateToService(action: String) {
+        if (instanceId.isEmpty()) return
+        try {
+            val intent = Intent(this, InstanceLifecycleService::class.java).apply {
+                this.action = action
+                putExtra(InstanceNotificationManager.EXTRA_INSTANCE_ID, instanceId)
+                if (guestPackageName.isNotBlank()) putExtra(EXTRA_PACKAGE_NAME, guestPackageName)
+                putExtra(EXTRA_STUB_INDEX, getStubIndex())
+            }
+            startService(intent)
+        } catch (_: Exception) {}
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == ACTION_FINISH_GUEST) {
+            RenjanaLog.i(TAG, "StubActivity[${getStubIndex()}] FINISH_GUEST (onNewIntent) — finishing")
+            finish()
+            return
+        }
+        val guestIntent = intent.getParcelableExtra<Intent>(EXTRA_GUEST_ORIGINAL_INTENT) ?: intent
+        try { onNewIntentMethod?.invoke(guestActivity, guestIntent) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onNewIntent failed: ${e.message}")
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        try {
+            val originalRequestCode = ActivityStubManager.resolveRequestCode(
+                instanceId, getStubIndex(), requestCode
+            )
+            onActivityResultMethod?.invoke(guestActivity, originalRequestCode, resultCode, data)
+        } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onActivityResult failed: ${e.message}")
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        try { onSaveInstanceStateMethod?.invoke(guestActivity, outState) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onSaveInstanceState failed: ${e.message}")
+        }
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        try { onRestoreInstanceStateMethod?.invoke(guestActivity, savedInstanceState) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onRestoreInstanceState failed: ${e.message}")
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (onBackPressedMethod != null) {
+            try {
+                onBackPressedMethod!!.invoke(guestActivity)
+            } catch (e: Exception) {
+                RenjanaLog.w(TAG, "Guest onBackPressed failed: ${e.message}")
+                @Suppress("DEPRECATION")
+                super.onBackPressed()
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        return try {
+            onKeyDownMethod?.invoke(guestActivity, keyCode, event) as? Boolean
+                ?: super.onKeyDown(keyCode, event)
+        } catch (e: Exception) {
+            super.onKeyDown(keyCode, event)
+        }
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        return try {
+            onKeyUpMethod?.invoke(guestActivity, keyCode, event) as? Boolean
+                ?: super.onKeyUp(keyCode, event)
+        } catch (e: Exception) {
+            super.onKeyUp(keyCode, event)
+        }
+    }
+
+    override fun onTouchEvent(event: MotionEvent?): Boolean {
+        return try {
+            onTouchEventMethod?.invoke(guestActivity, event) as? Boolean
+                ?: super.onTouchEvent(event)
+        } catch (e: Exception) {
+            super.onTouchEvent(event)
+        }
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu?): Boolean {
+        return try {
+            onCreateOptionsMenuMethod?.invoke(guestActivity, menu) as? Boolean
+                ?: super.onCreateOptionsMenu(menu)
+        } catch (e: Exception) {
+            super.onCreateOptionsMenu(menu)
+        }
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return try {
+            onOptionsItemSelectedMethod?.invoke(guestActivity, item) as? Boolean
+                ?: super.onOptionsItemSelected(item)
+        } catch (e: Exception) {
+            super.onOptionsItemSelected(item)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        try {
+            onRequestPermissionsResultMethod?.invoke(
+                guestActivity, requestCode, permissions, grantResults
+            )
+        } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onRequestPermissionsResult failed: ${e.message}")
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        try { onConfigurationChangedMethod?.invoke(guestActivity, newConfig) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onConfigurationChanged failed: ${e.message}")
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        try { onWindowFocusChangedMethod?.invoke(guestActivity, hasFocus) } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest onWindowFocusChanged failed: ${e.message}")
+        }
+    }
+
+    private var guestTheme: Resources.Theme? = null
+
+    private val stubThemeResource: Int
+        get() = try {
+            val f = android.view.ContextThemeWrapper::class.java.getDeclaredField("mThemeResource")
+            f.isAccessible = true
+            f.getInt(this)
+        } catch (_: Throwable) {
+            0
+        }
+
+    override fun getTheme(): Resources.Theme {
+        val guestRes = virtualClassLoader?.getResources(this)
+        if (guestRes != null) {
+            if (guestTheme == null) {
+                guestTheme = guestRes.newTheme()
+                if (effectiveGuestTheme != 0) {
+                    try {
+                        guestTheme?.applyStyle(effectiveGuestTheme, true)
+                    } catch (_: Throwable) {}
+                } else {
+                    val hostTheme = stubThemeResource.takeIf { it != 0 }
+                        ?: com.fesu.renjana.R.style.Theme_Renjana
+                    try {
+                        guestTheme?.applyStyle(hostTheme, true)
+                    } catch (_: Throwable) {}
+                }
+            }
+            return guestTheme!!
+        }
+        return super.getTheme()
+    }
+
+    override fun setTheme(resid: Int) {
+        super.setTheme(resid)
+        guestTheme = null
+    }
+
+    override fun getResources(): Resources {
+        return virtualClassLoader?.getResources(this) ?: super.getResources()
+    }
+
+    override fun getAssets(): AssetManager {
+        return virtualClassLoader?.getAssets() ?: super.getAssets()
+    }
+
+    override fun getClassLoader(): ClassLoader {
+        return virtualClassLoader ?: super.getClassLoader()
+    }
+
+    override fun getLayoutInflater(): android.view.LayoutInflater {
+        val inflater = super.getLayoutInflater()
+        return inflater.cloneInContext(this)
+    }
+
+    fun startGuestActivityForResult(guestIntent: Intent, stubIntent: Intent, requestCode: Int) {
+        ActivityStubManager.registerRequestCode(instanceId, getStubIndex(), requestCode, guestIntent)
+        startActivityForResult(stubIntent, requestCode)
     }
 }
+
+class StubActivity_0 : StubActivity() { override fun getStubIndex(): Int = 0 }
+class StubActivity_1 : StubActivity() { override fun getStubIndex(): Int = 1 }
+class StubActivity_2 : StubActivity() { override fun getStubIndex(): Int = 2 }
+class StubActivity_3 : StubActivity() { override fun getStubIndex(): Int = 3 }
+class StubActivity_4 : StubActivity() { override fun getStubIndex(): Int = 4 }
+class StubActivity_5 : StubActivity() { override fun getStubIndex(): Int = 5 }
+class StubActivity_6 : StubActivity() { override fun getStubIndex(): Int = 6 }
+class StubActivity_7 : StubActivity() { override fun getStubIndex(): Int = 7 }
+class StubActivity_8 : StubActivity() { override fun getStubIndex(): Int = 8 }
+class StubActivity_9 : StubActivity() { override fun getStubIndex(): Int = 9 }
