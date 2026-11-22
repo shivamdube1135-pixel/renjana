@@ -46,7 +46,6 @@ class VirtualClassLoader(
             optimizedDir.mkdirs()
         }
 
-        // Android 14/15 requires dynamically loaded APK/DEX files to be read-only
         allApkPaths.forEach { path ->
             try {
                 val f = File(path)
@@ -57,8 +56,8 @@ class VirtualClassLoader(
         }
 
         val combinedDexPath = allApkPaths.joinToString(File.pathSeparator)
-        val libSearchPath = (listOfNotNull(nativeLibDir) + allApkPaths)
-            .joinToString(File.pathSeparator)
+        // Use extracted nativeLibDir cleanly so linker doesn't choke on APK zip paths
+        val libSearchPath = nativeLibDir
         dexClassLoader = DexClassLoader(
             combinedDexPath,
             optimizedDir.absolutePath,
